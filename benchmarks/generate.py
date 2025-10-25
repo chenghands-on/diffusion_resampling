@@ -20,24 +20,6 @@ import io
 from torchvision.utils import make_grid, save_image
 import classifier_lib
 from scipy.optimize import linear_sum_assignment
-import torch.nn as nn
-
-
-class SimpleDecoder(nn.Module):
-    """Simple decoder to reconstruct images from features"""
-    def __init__(self, feature_dim=512, output_dim=12288):
-        super().__init__()
-        self.decoder = nn.Sequential(
-            nn.Linear(feature_dim, 1024),
-            nn.ReLU(),
-            nn.Linear(1024, 2048),
-            nn.ReLU(),
-            nn.Linear(2048, output_dim),
-            nn.Tanh()
-        )
-    
-    def forward(self, features):
-        return self.decoder(features)
 
 
 def sinkhorn_barycentric_projection(X, weights, Y=None, eps=0.1, max_iter=200, tol=1e-6):
@@ -167,26 +149,11 @@ def diffusion_sampler(
                 weights_batch = weights[i]  # [num_particles]
                 print(f"Processing batch {i}, particles: {xt_batch.shape[0]}, weights: {weights_batch.shape}")
                 
-                # Extract features for OT resampling
-                with torch.no_grad():
-                    # Use classifier to extract features
-                    tau_expanded = torch.ones(xt_batch.shape[0], device=xt_batch.device) * t_cur
-                    features = classifier(xt_batch, timesteps=tau_expanded, feature=True)  # [num_particles, 512]
-                    features_flat = features.reshape(num_particles, -1)
+                # Flatten for OT resampling
+                xt_flat = xt_batch.reshape(num_particles, -1)  # [num_particles, C*H*W]
                 
-                print(f"Before OT - features shape: {features_flat.shape}, mean: {features_flat.mean():.4f}, std: {features_flat.std():.4f}")
-                
-                # Apply OT resampling in feature space
-                features_resampled = ot_resampling(features_flat, weights_batch)
-                print(f"After OT - features_resampled shape: {features_resampled.shape}, mean: {features_resampled.mean():.4f}, std: {features_resampled.std():.4f}")
-                
-                # Reconstruct images from resampled features
-                decoder = SimpleDecoder(feature_dim=features_flat.shape[1], output_dim=xt_batch.numel()//num_particles)
-                decoder = decoder.to(xt_batch.device)
-                
-                with torch.no_grad():
-                    xt_flat_resampled = decoder(features_resampled)
-                    xt_flat_resampled = xt_flat_resampled.reshape(num_particles, -1)
+                # Apply OT resampling
+                xt_flat_resampled = ot_resampling(xt_flat, weights_batch)
                 
                 # Reshape back to original shape
                 xt_batch_resampled = xt_flat_resampled.reshape(num_particles, *xt_batch.shape[1:])
