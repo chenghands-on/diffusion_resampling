@@ -19,13 +19,109 @@ import torch
 import io
 from torchvision.utils import make_grid, save_image
 import classifier_lib
+from scipy.optimize import linear_sum_assignment
+import torch.nn as nn
+
+
+class SimpleDecoder(nn.Module):
+    """Simple decoder to reconstruct images from features"""
+    def __init__(self, feature_dim=512, output_dim=12288):
+        super().__init__()
+        self.decoder = nn.Sequential(
+            nn.Linear(feature_dim, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, 2048),
+            nn.ReLU(),
+            nn.Linear(2048, output_dim),
+            nn.Tanh()
+        )
+    
+    def forward(self, features):
+        return self.decoder(features)
+
+
+def sinkhorn_barycentric_projection(X, weights, Y=None, eps=0.1, max_iter=200, tol=1e-6):
+    """
+    Sinkhorn barycentric projection for optimal transport resampling
+    """
+    try:
+        X_np = X if isinstance(X, np.ndarray) else X.detach().cpu().numpy()
+        weights_np = weights if isinstance(weights, np.ndarray) else weights.detach().cpu().numpy()
+        
+        N = X_np.shape[0]
+        weights_np = np.maximum(weights_np, 1e-12)
+        weights_np = weights_np / weights_np.sum()
+        
+        if Y is None:
+            # Use original positions as target
+            Y = X_np.copy()
+        
+        # Compute cost matrix (squared Euclidean distance)
+        C = np.sum(X_np**2, axis=1, keepdims=True) + np.sum(Y**2, axis=1, keepdims=True).T - 2 * X_np @ Y.T
+        
+        # Sinkhorn algorithm
+        K = np.exp(-C / eps)
+        u = np.ones(N) / N
+        v = np.ones(N) / N
+        
+        actual_iter = 0
+        for iter_count in range(max_iter):
+            u_prev = u.copy()
+            u = weights_np / (K @ v + 1e-12)
+            v = 1 / (K.T @ u + 1e-12)
+            
+            actual_iter = iter_count + 1
+            if np.max(np.abs(u - u_prev)) < tol:
+                break
+        
+        # Output iteration information
+        print(f"Sinkhorn converged in {actual_iter}/{max_iter} iterations (eps={eps}, tol={tol})")
+        if actual_iter == max_iter:
+            final_error = np.max(np.abs(u - u_prev))
+            print(f"WARNING: Sinkhorn did not converge! Final error: {final_error:.2e}")
+        
+        # Compute barycentric projection
+        P = np.diag(u) @ K @ np.diag(v)
+        X_resampled = P @ Y
+        
+        return X_resampled
+        
+    except Exception as e:
+        print(f"Sinkhorn failed: {e}, falling back to multinomial")
+        # Fallback to multinomial resampling
+        N = X.shape[0]
+        weights_np = weights.detach().cpu().numpy() if torch.is_tensor(weights) else weights
+        weights_np = np.maximum(weights_np, 1e-12)
+        weights_np = weights_np / weights_np.sum()
+        idx = np.random.choice(np.arange(N), size=N, p=weights_np)
+        return X[idx]
+
+
+def ot_resampling(x, weights, eps=0.1, max_iter=200, tol=1e-6):
+    """
+    Optimal transport resampling using Sinkhorn algorithm
+    """
+    try:
+        x_np = x.detach().cpu().numpy()
+        weights_np = weights.detach().cpu().numpy()
+        x_resampled = sinkhorn_barycentric_projection(x_np, weights_np, Y=None, eps=eps, max_iter=max_iter, tol=tol)
+        return torch.tensor(x_resampled, dtype=x.dtype, device=x.device)
+    except Exception as e:
+        print(f"OT resampling failed: {e}, falling back to multinomial")
+        # Fallback to multinomial resampling
+        N = x.shape[0]
+        weights_np = weights.detach().cpu().numpy()
+        weights_np = np.maximum(weights_np, 1e-12)
+        weights_np = weights_np / weights_np.sum()
+        idx = np.random.choice(np.arange(N), size=N, p=weights_np)
+        return x[idx]
 
 
 def diffusion_sampler(
     method, sampler, net, discriminator, vpsde, latents, class_labels=None, randn_like=torch.randn_like,
     multinomial=torch.multinomial, num_steps=18, sigma_min=0.002, sigma_max=80, rho=7, S_churn=0,
     S_min=0, S_max=float('inf'), S_noise=0, restart_info="", restart_gamma=0, num_particles=1,
-    dg_weight_1st_order=0.0, time_min=0.01, time_max=1.0, resample_inds=[]
+    dg_weight_1st_order=0.0, time_min=0.01, time_max=1.0, resample_inds=[], resampling_method='multinomial'
 ):
 
     def get_steps(min_t, max_t, num_steps, rho):
@@ -42,16 +138,88 @@ def diffusion_sampler(
         weights = ll_ratio / prev_ll_ratio
         # Resample
         weights = weights / weights.sum(dim=1, keepdim=True)
-        inds = multinomial(weights, num_samples=num_particles)
-        xt = xt.reshape(-1, num_particles, *xt.shape[1:])
-        xt = torch.gather(xt, 1, inds[:, :, None, None, None].expand(-1, -1, 3, xt.shape[-1], xt.shape[-1]))
-        xt = xt.reshape(-1, 3, xt.shape[-1], xt.shape[-1])
-        if class_labels is not None:
-            class_labels = class_labels.reshape(-1, num_particles, *class_labels.shape[1:])
-            class_labels = torch.gather(class_labels, 1, inds[..., None].expand(-1, -1, class_labels.shape[-1]))
-            class_labels = class_labels.reshape(-1, class_labels.shape[-1])
         
-        prev_ll_ratio = torch.gather(ll_ratio, 1, inds)
+        if resampling_method == 'multinomial':
+            # Multinomial resampling
+            inds = multinomial(weights, num_samples=num_particles)
+            xt = xt.reshape(-1, num_particles, *xt.shape[1:])
+            xt = torch.gather(xt, 1, inds[:, :, None, None, None].expand(-1, -1, 3, xt.shape[-1], xt.shape[-1]))
+            xt = xt.reshape(-1, 3, xt.shape[-1], xt.shape[-1])
+            if class_labels is not None:
+                class_labels = class_labels.reshape(-1, num_particles, *class_labels.shape[1:])
+                class_labels = torch.gather(class_labels, 1, inds[..., None].expand(-1, -1, class_labels.shape[-1]))
+                class_labels = class_labels.reshape(-1, class_labels.shape[-1])
+            prev_ll_ratio = torch.gather(ll_ratio, 1, inds)
+            
+        elif resampling_method == 'ot':
+            # Optimal transport resampling
+            xt_reshaped = xt.reshape(-1, num_particles, *xt.shape[1:])
+            class_labels_reshaped = class_labels.reshape(-1, num_particles, *class_labels.shape[1:]) if class_labels is not None else None
+            
+            xt_resampled = []
+            class_labels_resampled = []
+            prev_ll_ratio_resampled = []
+            print(xt_reshaped.shape)
+            
+            for i in range(xt_reshaped.shape[0]):
+                # Process each batch separately
+                xt_batch = xt_reshaped[i]  # [num_particles, C, H, W]
+                weights_batch = weights[i]  # [num_particles]
+                print(f"Processing batch {i}, particles: {xt_batch.shape[0]}, weights: {weights_batch.shape}")
+                
+                # Extract features for OT resampling
+                with torch.no_grad():
+                    # Use classifier to extract features
+                    tau_expanded = torch.ones(xt_batch.shape[0], device=xt_batch.device) * t_cur
+                    features = classifier(xt_batch, timesteps=tau_expanded, feature=True)  # [num_particles, 512]
+                    features_flat = features.reshape(num_particles, -1)
+                
+                print(f"Before OT - features shape: {features_flat.shape}, mean: {features_flat.mean():.4f}, std: {features_flat.std():.4f}")
+                
+                # Apply OT resampling in feature space
+                features_resampled = ot_resampling(features_flat, weights_batch)
+                print(f"After OT - features_resampled shape: {features_resampled.shape}, mean: {features_resampled.mean():.4f}, std: {features_resampled.std():.4f}")
+                
+                # Reconstruct images from resampled features
+                decoder = SimpleDecoder(feature_dim=features_flat.shape[1], output_dim=xt_batch.numel()//num_particles)
+                decoder = decoder.to(xt_batch.device)
+                
+                with torch.no_grad():
+                    xt_flat_resampled = decoder(features_resampled)
+                    xt_flat_resampled = xt_flat_resampled.reshape(num_particles, -1)
+                
+                # Reshape back to original shape
+                xt_batch_resampled = xt_flat_resampled.reshape(num_particles, *xt_batch.shape[1:])
+                xt_resampled.append(xt_batch_resampled)
+                
+                # Handle class labels if present
+                if class_labels_reshaped is not None:
+                    class_labels_batch = class_labels_reshaped[i]
+                    # For class labels, we use multinomial resampling as OT doesn't make sense for discrete labels
+                    weights_np = weights_batch.detach().cpu().numpy()
+                    weights_np = np.maximum(weights_np, 1e-12)
+                    weights_np = weights_np / weights_np.sum()
+                    idx = np.random.choice(np.arange(num_particles), size=num_particles, p=weights_np)
+                    class_labels_batch_resampled = class_labels_batch[idx]
+                    class_labels_resampled.append(class_labels_batch_resampled)
+                
+                # Handle prev_ll_ratio
+                weights_np = weights_batch.detach().cpu().numpy()
+                weights_np = np.maximum(weights_np, 1e-12)
+                weights_np = weights_np / weights_np.sum()
+                idx = np.random.choice(np.arange(num_particles), size=num_particles, p=weights_np)
+                prev_ll_ratio_batch = ll_ratio[i][idx]
+                prev_ll_ratio_resampled.append(prev_ll_ratio_batch)
+            
+            # Concatenate results
+            xt = torch.stack(xt_resampled, dim=0).reshape(-1, *xt.shape[1:])
+            if class_labels_reshaped is not None:
+                class_labels = torch.stack(class_labels_resampled, dim=0).reshape(-1, *class_labels.shape[1:])
+            prev_ll_ratio = torch.stack(prev_ll_ratio_resampled, dim=0).reshape(-1, num_particles)
+            
+        else:
+            raise ValueError(f"Unknown resampling method: {resampling_method}")
+        
         return xt, class_labels, prev_ll_ratio
 
     # Adjust noise levels based on what's supported by the network.
@@ -226,6 +394,7 @@ def parse_int_list(s):
 @click.option('--num_particles',               help='Number of particles',           metavar='INT',                       type=click.IntRange(min=1), default=4, show_default=True)
 @click.option('--device',                  help='Device', metavar='STR',                                            type=str, default='cuda:0')
 @click.option('--resample_inds',           help='Indices for resampling',      metavar='LIST',                      type=parse_int_list, default='', show_default=True)
+@click.option('--resampling_method',       help='Resampling method',           metavar='STR',                       type=click.Choice(['multinomial', 'ot']), default='multinomial', show_default=True)
 
 # Restart parameters
 @click.option('--restart_info', 'restart_info',               help='restart information', metavar='STR',            type =str, default='', show_default=True)
@@ -241,7 +410,7 @@ def parse_int_list(s):
 ## Discriminator architecture
 @click.option('--cond',                    help='Is it conditional discriminator?', metavar='INT',                  type=click.IntRange(min=0, max=1), default=1, show_default=True)
 
-def main(sampler, method, dg_weight_1st_order, cond, pretrained_classifier_ckpt, discriminator_ckpt, batch_size, seeds, num_particles, network_pkl, outdir, class_idx, device, resample_inds, **sampler_kwargs):
+def main(sampler, method, dg_weight_1st_order, cond, pretrained_classifier_ckpt, discriminator_ckpt, batch_size, seeds, num_particles, network_pkl, outdir, class_idx, device, resample_inds, resampling_method, **sampler_kwargs):
     
     ## Check arguments
     if method == 'dg':
@@ -288,7 +457,7 @@ def main(sampler, method, dg_weight_1st_order, cond, pretrained_classifier_ckpt,
 
         ## Generate images.
         sampler_kwargs = {key: value for key, value in sampler_kwargs.items() if value is not None}
-        images, ll_ratios = diffusion_sampler(method, sampler, net, discriminator, vpsde, latents, class_labels, randn_like=rnd.randn_like, num_particles=num_particles, dg_weight_1st_order=dg_weight_1st_order, resample_inds=resample_inds, multinomial=rnd.multinomial, **sampler_kwargs)
+        images, ll_ratios = diffusion_sampler(method, sampler, net, discriminator, vpsde, latents, class_labels, randn_like=rnd.randn_like, num_particles=num_particles, dg_weight_1st_order=dg_weight_1st_order, resample_inds=resample_inds, multinomial=rnd.multinomial, resampling_method=resampling_method, **sampler_kwargs)
 
         ## Save images.
         images_np = (images * 127.5 + 128).clip(0, 255).to(torch.uint8).permute(0, 2, 3, 1).cpu().numpy()

@@ -9,7 +9,7 @@ echo "Running on $1"
 echo "Diffusion sampler: $2"
 echo "Number of particles: $3"
 
-num_images=$(($3 * 50000 - 1))
+num_images=$(($3 * 500 - 1))
 
 # Check the dataset name
 if [ "$1" == "imagenet" ]; then
